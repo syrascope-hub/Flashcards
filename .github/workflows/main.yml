@@ -1,0 +1,201 @@
+name: Build APK
+
+"on":
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find and unzip project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No ZIP file found in repository root."
+            exit 1
+          fi
+          echo "Using project archive: $ZIP"
+          mkdir -p unpacked
+          unzip -q -o "$ZIP" -d unpacked
+          if [ ! -f unpacked/flashcards_app/pubspec.yaml ]; then
+            echo "ERROR: unpacked/flashcards_app/pubspec.yaml not found."
+            find unpacked -maxdepth 4 -name pubspec.yaml -print
+            exit 1
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
+            echo "ERROR: Android SDK directory not found."
+            exit 1
+          fi
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found under Android SDK."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Generate Android project
+        working-directory: unpacked/flashcards_app
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/keep
+          cp -r lib /tmp/keep/lib
+          cp pubspec.yaml /tmp/keep/pubspec.yaml
+
+          flutter create . \
+            --project-name flashcards_app \
+            --org com.example \
+            --platforms=android
+
+          rm -rf lib test
+          cp -r /tmp/keep/lib lib
+          cp /tmp/keep/pubspec.yaml pubspec.yaml
+
+      - name: Configure Android permissions and notifications
+        working-directory: unpacked/flashcards_app
+        run: python3 tools/setup_android.py
+
+      - name: Fix Android SDK and ML Kit dependencies
+        working-directory: unpacked/flashcards_app
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          pubspec = Path("pubspec.yaml")
+          lines = pubspec.read_text(encoding="utf-8").splitlines()
+          versions = {
+              "file_picker": "10.3.10",
+              "google_mlkit_text_recognition": "0.15.1",
+          }
+          updated = set()
+
+          for i, line in enumerate(lines):
+              match = re.match(r"^([ \t]*)([A-Za-z0-9_]+):", line)
+              if match and match.group(2) in versions:
+                  key = match.group(2)
+                  comment = ""
+                  if "#" in line:
+                      comment = "  " + line[line.index("#"):]
+                  lines[i] = f"{match.group(1)}{key}: {versions[key]}{comment}"
+                  updated.add(key)
+
+          missing = set(versions) - updated
+          if missing:
+              raise SystemExit(
+                  "ERROR: Dependencies not found in pubspec.yaml: "
+                  + ", ".join(sorted(missing))
+              )
+          pubspec.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          app_dir = Path("android/app")
+          gradle_path = next(
+              (app_dir / name for name in ("build.gradle.kts", "build.gradle")
+               if (app_dir / name).exists()),
+              None,
+          )
+          if gradle_path is None:
+              raise SystemExit("ERROR: Android app Gradle file not found.")
+
+          is_kts = gradle_path.name.endswith(".kts")
+          gradle = gradle_path.read_text(encoding="utf-8")
+
+          if is_kts:
+              sdk_pattern = r"(?m)^([ \t]*compileSdk[ \t]*=[ \t]*)[^\n]+"
+          else:
+              sdk_pattern = (
+                  r"(?m)^([ \t]*compileSdkVersion[ \t]+|"
+                  r"[ \t]*compileSdk[ \t]*=[ \t]*|"
+                  r"[ \t]*compileSdk[ \t]+)[^\n]+"
+              )
+
+          gradle, count = re.subn(
+              sdk_pattern, lambda m: m.group(1) + "36", gradle, count=1
+          )
+          if count != 1:
+              raise SystemExit("ERROR: Could not set app compileSdk to 36.")
+
+          mlkit_dependencies = [
+              "com.google.mlkit:text-recognition-chinese:16.0.1",
+              "com.google.mlkit:text-recognition-devanagari:16.0.1",
+              "com.google.mlkit:text-recognition-japanese:16.0.1",
+              "com.google.mlkit:text-recognition-korean:16.0.1",
+          ]
+
+          for dependency in mlkit_dependencies:
+              if dependency in gradle:
+                  continue
+              block = re.search(r"(?m)^[ \t]*dependencies[ \t]*\{", gradle)
+              if block is None:
+                  raise SystemExit("ERROR: Gradle dependencies block not found.")
+              entry = (
+                  f'    implementation("{dependency}")\n'
+                  if is_kts else f"    implementation '{dependency}'\n"
+              )
+              gradle = gradle[:block.end()] + "\n" + entry + gradle[block.end():]
+
+          gradle_path.write_text(gradle, encoding="utf-8")
+          print("Configured compileSdk 36 and ML Kit language dependencies.")
+          PY
+
+      - name: Install Flutter dependencies
+        working-directory: unpacked/flashcards_app
+        run: flutter pub get
+
+      - name: Analyze Flutter project
+        working-directory: unpacked/flashcards_app
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        working-directory: unpacked/flashcards_app
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashcards-apk
+          path: unpacked/flashcards_app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
