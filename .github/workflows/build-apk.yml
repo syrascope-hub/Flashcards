@@ -1,0 +1,211 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip project
+        shell: bash
+        run: |
+          ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No project ZIP file found in repository root."
+            exit 1
+          fi
+
+          echo "Using: $ZIP"
+          mkdir -p unpacked
+          unzip -q -o "$ZIP" -d unpacked
+          test -f unpacked/flashcards_app/pubspec.yaml
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        working-directory: unpacked/flashcards_app
+        shell: bash
+        run: |
+          mkdir -p /tmp/keep
+          cp -r lib /tmp/keep/lib
+          cp pubspec.yaml /tmp/keep/pubspec.yaml
+
+          flutter create . \
+            --project-name flashcards_app \
+            --org com.example \
+            --platforms=android
+
+          rm -rf lib test
+          cp -r /tmp/keep/lib lib
+          cp /tmp/keep/pubspec.yaml pubspec.yaml
+
+      - name: Configure Android permissions and notifications
+        working-directory: unpacked/flashcards_app
+        run: python3 tools/setup_android.py
+
+      - name: Fix Android SDK and ML Kit dependencies
+        working-directory: unpacked/flashcards_app
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          # Update dependencies in pubspec.yaml.
+          pubspec_path = Path("pubspec.yaml")
+          pubspec = pubspec_path.read_text(encoding="utf-8")
+
+          updates = [
+              (
+                  r"(?m)^([ \t]*file_picker:[ \t]*)[^\s#]+",
+                  r"\g<1>^10.3.11",
+                  "file_picker",
+              ),
+              (
+                  r"(?m)^([ \t]*google_mlkit_text_recognition:[ \t]*)[^\s#]+",
+                  r"\g<1>^0.15.1",
+                  "google_mlkit_text_recognition",
+              ),
+          ]
+
+          for pattern, replacement, name in updates:
+              pubspec, count = re.subn(
+                  pattern, replacement, pubspec, count=1
+              )
+              if count != 1:
+                  raise SystemExit(
+                      f"ERROR: Could not update {name} in pubspec.yaml"
+                  )
+
+          pubspec_path.write_text(pubspec, encoding="utf-8")
+
+          # Find the generated app Gradle file.
+          app_dir = Path("android/app")
+          gradle_path = next(
+              (
+                  app_dir / name
+                  for name in ("build.gradle.kts", "build.gradle")
+                  if (app_dir / name).exists()
+              ),
+              None,
+          )
+
+          if gradle_path is None:
+              raise SystemExit("ERROR: Android app Gradle file not found")
+
+          is_kts = gradle_path.name.endswith(".kts")
+          gradle = gradle_path.read_text(encoding="utf-8")
+
+          # Ensure the app compiles against Android SDK 36.
+          sdk_patterns = [
+              r"(?m)^([ \t]*compileSdkVersion[ \t]+).*$",
+              r"(?m)^([ \t]*compileSdk[ \t]*=[ \t]*).*$",
+              r"(?m)^([ \t]*compileSdk[ \t]+).*$",
+          ]
+
+          for pattern in sdk_patterns:
+              gradle, count = re.subn(
+                  pattern,
+                  lambda match: match.group(1) + "36",
+                  gradle,
+                  count=1,
+              )
+              if count:
+                  break
+          else:
+              raise SystemExit(
+                  "ERROR: Could not set compileSdk to 36"
+              )
+
+          # Include all language recognizers referenced by ML Kit.
+          mlkit_dependencies = [
+              "com.google.mlkit:text-recognition-chinese:16.0.1",
+              "com.google.mlkit:text-recognition-devanagari:16.0.1",
+              "com.google.mlkit:text-recognition-japanese:16.0.1",
+              "com.google.mlkit:text-recognition-korean:16.0.1",
+          ]
+
+          for dependency in mlkit_dependencies:
+              if dependency in gradle:
+                  continue
+
+              block = re.search(
+                  r"(?m)^[ \t]*dependencies[ \t]*\{",
+                  gradle,
+              )
+
+              if block is None:
+                  raise SystemExit(
+                      "ERROR: Gradle dependencies block not found"
+                  )
+
+              if is_kts:
+                  line = f'    implementation("{dependency}")\n'
+              else:
+                  line = f"    implementation '{dependency}'\n"
+
+              gradle = (
+                  gradle[:block.end()]
+                  + "\n"
+                  + line
+                  + gradle[block.end():]
+              )
+
+          gradle_path.write_text(gradle, encoding="utf-8")
+
+          print("Updated file_picker and ML Kit versions.")
+          print("Configured compileSdk 36.")
+          print("Added missing ML Kit language dependencies.")
+
+          PY
+
+      - name: Install dependencies
+        working-directory: unpacked/flashcards_app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: unpacked/flashcards_app
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        working-directory: unpacked/flashcards_app
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashcards-apk
+          path: unpacked/flashcards_app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
